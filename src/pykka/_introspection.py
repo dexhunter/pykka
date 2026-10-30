@@ -22,42 +22,64 @@ def introspect_attrs(
 ) -> dict[AttrPath, AttrInfo]:
     """Introspects the actor's attributes."""
     result: dict[AttrPath, AttrInfo] = {}
-    attr_paths_to_visit: list[AttrPath] = [(attr_name,) for attr_name in dir(root)]
+    object_attrs = dict(object.__dict__)
+    attr_infos = (
+        AttrInfo(callable=False, traversable=False),
+        AttrInfo(callable=True, traversable=False),
+    )
+    attr_groups_to_visit: list[tuple[AttrPath, list[str]]] = [((), dir(root))]
 
-    while attr_paths_to_visit:
-        attr_path = attr_paths_to_visit.pop(0)
+    while attr_groups_to_visit:
+        next_attr_groups: list[tuple[AttrPath, list[str]]] = []
+        for parent_path, attr_names in attr_groups_to_visit:
+            for attr_name in attr_names:
+                if attr_name.startswith("_"):
+                    # Attribute names starting with _ are considered private and are
+                    # not exposed via ActorProxy.
+                    continue
 
-        if attr_path[-1].startswith("_"):
-            # Attribute names starting with _ are considered private and are
-            # not exposed via ActorProxy.
-            continue
+                attr_path = (*parent_path, attr_name)
+                parent = get_attr_directly(root, parent_path) if parent_path else root
+                parent_attrs: dict[str, Any] = {}
+                for cls in reversed(parent.__class__.mro()):
+                    parent_attrs |= object_attrs if cls is object else cls.__dict__
+                if hasattr(parent, "__dict__"):
+                    parent_attrs |= parent.__dict__
+                try:
+                    attr = parent_attrs[attr_name]
+                except KeyError:
+                    msg = (
+                        f"type object {parent.__class__.__name__!r} "
+                        f"has no attribute {attr_name!r}"
+                    )
+                    raise AttributeError(msg) from None
 
-        attr = get_attr_from_parent(root, attr_path)
+                # Keep `proxy` first to use its `__eq__` method instead of `attr`'s
+                # unknown implementation.
+                if proxy == attr:
+                    logger.warning(
+                        f"{root} attribute {'.'.join(attr_path)!r} "
+                        f"is a proxy to itself. "
+                        f"Consider making it private "
+                        f"by renaming it to {'_' + attr_path[-1]!r}."
+                    )
+                    continue
 
-        # Keep `proxy` first to use its `__eq__` method instead of `attr`'s
-        # unknown implementation.
-        if proxy == attr:
-            logger.warning(
-                f"{root} attribute {'.'.join(attr_path)!r} "
-                f"is a proxy to itself. "
-                f"Consider making it private "
-                f"by renaming it to {'_' + attr_path[-1]!r}."
-            )
-            continue
+                is_callable = callable(attr)
+                traversable = (
+                    getattr(attr, "_pykka_traversable", False) is True
+                    or getattr(attr, "pykka_traversable", False) is True
+                )
+                attr_info = (
+                    AttrInfo(callable=is_callable, traversable=True)
+                    if traversable
+                    else attr_infos[is_callable]
+                )
+                result[attr_path] = attr_info
 
-        attr_info = AttrInfo(
-            callable=callable(attr),
-            traversable=(
-                getattr(attr, "_pykka_traversable", False) is True
-                or getattr(attr, "pykka_traversable", False) is True
-            ),
-        )
-        result[attr_path] = attr_info
-
-        if attr_info.traversable:
-            attr_paths_to_visit.extend(
-                [(*attr_path, attr_name) for attr_name in dir(attr)]
-            )
+                if attr_info.traversable:
+                    next_attr_groups.append((attr_path, dir(attr)))
+        attr_groups_to_visit = next_attr_groups
 
     return result
 
